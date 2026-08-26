@@ -37,15 +37,11 @@ GAME_PLACE_IDS = [
 # The bot watches how many people have earned each one; if that count ticks
 # up, it alerts you (useful for a rare/secret badge, e.g. tells you someone
 # just found it).
-EXTRA_BADGE_IDS = [
-    2148576700,  # WELCOME
-]
+EXTRA_BADGE_IDS = []
 
 # ---- Specific user IDs to watch for "coming online" (added by profile link,
 # not username, so these never break if the account renames) ----
-EXTRA_USER_IDS = [
-    669700475,
-]
+EXTRA_USER_IDS = []
 
 # ---- Roblox usernames to watch for "coming online" ----
 WATCH_USERNAMES = [
