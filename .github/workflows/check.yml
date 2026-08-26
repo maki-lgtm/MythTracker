@@ -2,7 +2,7 @@ name: Myth Hunting Check
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour, on the hour (UTC)
+           - cron: "*/5 * * * *"
   workflow_dispatch: {}     # lets you also click "Run workflow" manually
 
 permissions:
