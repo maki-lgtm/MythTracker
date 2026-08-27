@@ -10,4 +10,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Test scheduler
-        run: echo "Scheduled workflow fired at $(date -u)"
+        run: echo "Scheduled workflow fired at $(date -u)!" 
