@@ -29,8 +29,12 @@ GAME_PLACE_IDS = [
     13947740435, 105555476192048, 16119191055, 108378640971562,
     8899336341, 15500992481, 17875192682, 16529500692, 8793592971,
     7630414489, 18250128060, 121688632073304, 111490998558484,
-    88888755, 375807536, 15453303673, 88461642144974, 7038244395,
-    12960116279, 4463100972, 14001835938,
+    5620453624, 375807536, 15453303673, 88461642144974, 7038244395,
+    12960116279, 4463100972, 14001835938, 4892161191, 2503371435,
+    316624534, 4746308994, 3161352649, 2983623754, 96923836994493,
+    12141611336, 14619285685, 2011273269, 2065821410, 6069595082,
+    2986558181, 5567471806, 9041405753, 2610191817, 18435782607,
+    12994826267, 71591683104334, 9009139090, 13273713934, 13275045990
 ]
 
 # ---- Specific badge IDs to watch directly (not tied to a tracked game) ----
@@ -53,7 +57,9 @@ WATCH_USERNAMES = [
     "JoshuaCult", "WillCult", "NickCult", "EmmettCult", "JackCult",
     "TheForgottenScholar", "AkaManah", "RabbitRevenge", "NothingIsOnAccident",
     "RobertSmiles", "DanStickman", "SethSmiIes", "MatthewJSmiles",
-    "ClairJSmiles", "LemonB0yy",
+    "ClairJSmiles", "LemonB0yy", "AscendentOne", "Osimker", "HeadOfTaCo",
+    "therulerofnothing", "Littlenathanial", "Bobbys_Here", "MrRealism",
+    "Taupea", "holovilleMentor"
 ]
 
 # ---- Groups + exact rank names to watch for new members ----
