@@ -174,9 +174,15 @@ def check_games(state):
         prev_updated = state["game_updated"].get(key)
         game_changed = False
 
-        if prev_updated is not None and updated and updated != prev_updated:
-            alerts.append(f"🔧 **{name}** was updated (<https://www.roblox.com/games/{uid}>)")
-            game_changed = True
+       if prev_updated is not None and updated and updated != prev_updated:
+    root_place_id = info.get("rootPlaceId")
+    game_url = (
+        f"https://www.roblox.com/games/{root_place_id}"
+        if root_place_id
+        else f"https://www.roblox.com/games/{uid}"
+    )
+    alerts.append(f"🔧 **{name}** was updated (<{game_url}>)")
+    game_changed = True
         state["game_updated"][key] = updated
 
         # Badges
