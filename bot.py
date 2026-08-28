@@ -9,10 +9,10 @@ Checks, once per run:
 Sends everything it finds to a Discord webhook, then saves what it saw
 to state.json so next run only reports NEW stuff.
 
-Alerts for the same exact event are limited to once every 30 minutes.
+The same exact event cannot be announced more than once every 30 minutes.
 
-You should not need to edit this file. Edit config.py to change what's
-tracked. See README.md for setup instructions.
+You should not need to edit this file.
+Edit config.py to change what's tracked.
 """
 
 import json
@@ -28,16 +28,18 @@ STATE_FILE = "state.json"
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "myth-hunting-bot/1.0"})
+SESSION.headers.update({
+    "User-Agent": "myth-hunting-bot/1.0"
+})
 
-REQUEST_DELAY = 0.4  # small pause between calls to be gentle on Roblox's API
+REQUEST_DELAY = 0.4
 
-# Same exact event cannot be announced more than once during this period.
+# Same event cannot be announced again during this period.
 ALERT_COOLDOWN_MINUTES = 30
 
 
 # -------------------------------------------------------------------
-# small helpers
+# HTTP helpers
 # -------------------------------------------------------------------
 
 def get_json(url, **kwargs):
@@ -62,12 +64,20 @@ def get_json(url, **kwargs):
 
 
 def post_json(url, payload):
+    """POST JSON and return parsed JSON, with basic retry."""
     for attempt in range(3):
         try:
-            resp = SESSION.post(url, json=payload, timeout=15)
+            resp = SESSION.post(
+                url,
+                json=payload,
+                timeout=15
+            )
 
             if resp.status_code == 200:
                 return resp.json()
+
+            if resp.status_code == 204:
+                return {}
 
             if resp.status_code == 429:
                 time.sleep(2 + attempt * 2)
@@ -81,32 +91,33 @@ def post_json(url, payload):
     return None
 
 
+# -------------------------------------------------------------------
+# State
+# -------------------------------------------------------------------
+
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    else:
+        state = {}
 
-        # Add the cooldown dictionary if this is an older state.json
-        # that was created before cooldown support existed.
-        if "alert_cooldowns" not in state:
-            state["alert_cooldowns"] = {}
+    # Make sure every required section exists.
+    state.setdefault("place_to_universe", {})
+    state.setdefault("game_badges", {})
+    state.setdefault("game_updated", {})
+    state.setdefault("group_members", {})
+    state.setdefault("user_ids", {})
+    state.setdefault("user_online", {})
+    state.setdefault("dynamic_watch_users", {})
+    state.setdefault("badge_award_counts", {})
+    state.setdefault("extra_user_names", {})
+    state.setdefault("alert_cooldowns", {})
 
-        return state
-
-    return {
-        "place_to_universe": {},   # placeId -> universeId
-        "game_badges": {},         # universeId -> [badgeIds seen]
-        "game_updated": {},        # universeId -> last known updated timestamp
-        "group_members": {},       # "groupId:roleId" -> [userIds seen]
-        "user_ids": {},            # username -> userId
-        "user_online": {},         # userId -> True/False (last known state)
-        "dynamic_watch_users": {}, # userId -> username, added from game owners
-        "badge_award_counts": {},  # badgeId -> last known awardedCount
-        "extra_user_names": {},    # userId -> resolved display name
-
-        # alert key -> ISO timestamp of the last time it was announced
-        "alert_cooldowns": {},
-    }
+    return state
 
 
 def save_state(state):
@@ -124,13 +135,16 @@ def now_iso():
 
 def should_alert(state, alert_key):
     """
-    Return True if this exact alert is allowed to be sent.
+    Return True if this alert is allowed to be announced.
 
     The same alert key can only be announced once every
     ALERT_COOLDOWN_MINUTES minutes.
     """
 
-    cooldowns = state.setdefault("alert_cooldowns", {})
+    cooldowns = state.setdefault(
+        "alert_cooldowns",
+        {}
+    )
 
     previous = cooldowns.get(alert_key)
 
@@ -138,21 +152,26 @@ def should_alert(state, alert_key):
         try:
             previous_time = datetime.fromisoformat(previous)
 
-            # Make sure old timestamps without timezone information
-            # don't cause comparison errors.
             if previous_time.tzinfo is None:
-                previous_time = previous_time.replace(tzinfo=timezone.utc)
+                previous_time = previous_time.replace(
+                    tzinfo=timezone.utc
+                )
 
             age = datetime.now(timezone.utc) - previous_time
 
-            if age < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+            if age < timedelta(
+                minutes=ALERT_COOLDOWN_MINUTES
+            ):
+                print(
+                    f"Cooldown active for {alert_key}; "
+                    f"skipping alert."
+                )
                 return False
 
         except (ValueError, TypeError):
-            # If an old/broken timestamp exists, allow the alert.
             pass
 
-    # Record the time this alert was allowed.
+    # Record the time this event was allowed.
     cooldowns[alert_key] = now_iso()
 
     return True
@@ -163,8 +182,7 @@ def should_alert(state, alert_key):
 # -------------------------------------------------------------------
 
 def send_to_discord(lines, title):
-    """Send a batch of alert lines to Discord, chunked to stay under
-    Discord's per-message character limit."""
+    """Send alert lines to Discord in safe-sized messages."""
 
     if not lines or not WEBHOOK_URL:
         return
@@ -174,7 +192,8 @@ def send_to_discord(lines, title):
     chunks = []
 
     for line in lines:
-        if chunk_len + len(line) > 1800:
+        # Keep messages comfortably below Discord's limit.
+        if chunk and chunk_len + len(line) > 1800:
             chunks.append(chunk)
             chunk = []
             chunk_len = 0
@@ -186,7 +205,10 @@ def send_to_discord(lines, title):
         chunks.append(chunk)
 
     for c in chunks:
-        content = f"**{title}**\n" + "\n".join(c)
+        content = (
+            f"**{title}**\n"
+            + "\n".join(c)
+        )
 
         post_json(
             WEBHOOK_URL,
@@ -207,7 +229,8 @@ def resolve_universe_id(place_id, state):
         return state["place_to_universe"][key]
 
     data = get_json(
-        f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
+        f"https://apis.roblox.com/universes/v1/places/"
+        f"{place_id}/universe"
     )
 
     time.sleep(REQUEST_DELAY)
@@ -223,69 +246,108 @@ def check_games(state):
     alerts = []
     new_owner_watches = []
 
-    # Resolve all universe IDs first
     universe_ids = []
 
+    # Resolve all universe IDs first.
     for place_id in config.GAME_PLACE_IDS:
-        uid = resolve_universe_id(place_id, state)
+        uid = resolve_universe_id(
+            place_id,
+            state
+        )
 
         if uid:
             universe_ids.append(uid)
 
-    # Batch-fetch game info (name, updated time, creator) in chunks of 50
+    # Fetch game information in chunks of 50.
     game_info = {}
 
     for i in range(0, len(universe_ids), 50):
         chunk = universe_ids[i:i + 50]
-        ids_param = ",".join(str(u) for u in chunk)
+
+        ids_param = ",".join(
+            str(u)
+            for u in chunk
+        )
 
         data = get_json(
-            f"https://games.roblox.com/v1/games?universeIds={ids_param}"
+            f"https://games.roblox.com/v1/games"
+            f"?universeIds={ids_param}"
         )
 
         time.sleep(REQUEST_DELAY)
 
         if data and "data" in data:
-            for g in data["data"]:
-                game_info[g["id"]] = g
+            for game in data["data"]:
+                game_info[game["id"]] = game
 
     for uid in universe_ids:
+
         info = game_info.get(uid)
 
         if not info:
             continue
 
-        name = info.get("name", f"Universe {uid}")
+        name = info.get(
+            "name",
+            f"Universe {uid}"
+        )
+
         updated = info.get("updated")
 
-        creator = info.get("creator", {})
+        creator = info.get(
+            "creator",
+            {}
+        )
+
         creator_id = creator.get("id")
         creator_name = creator.get("name")
         creator_type = creator.get("type")
 
         key = str(uid)
 
-        prev_updated = state["game_updated"].get(key)
+        previous_updated = state[
+            "game_updated"
+        ].get(key)
+
         game_changed = False
 
         # -----------------------------------------------------------
         # Game update check
         # -----------------------------------------------------------
 
-        if prev_updated is not None and updated and updated != prev_updated:
-            root_place_id = info.get("rootPlaceId")
-
-            game_url = (
-                f"https://www.roblox.com/games/{root_place_id}"
-                if root_place_id
-                else f"https://www.roblox.com/games/{uid}"
+        if (
+            previous_updated is not None
+            and updated
+            and updated != previous_updated
+        ):
+            root_place_id = info.get(
+                "rootPlaceId"
             )
 
-            alert_key = f"game_update:{uid}:{updated}"
+            if root_place_id:
+                game_url = (
+                    f"https://www.roblox.com/games/"
+                    f"{root_place_id}"
+                )
+            else:
+                game_url = (
+                    f"https://www.roblox.com/games/"
+                    f"{uid}"
+                )
 
-            if should_alert(state, alert_key):
+            # IMPORTANT:
+            # The cooldown key does NOT contain "updated".
+            # That means repeated detections of the same game's
+            # update are suppressed for 30 minutes.
+            alert_key = f"game_update:{uid}"
+
+            if should_alert(
+                state,
+                alert_key
+            ):
                 alerts.append(
-                    f"🔧 **{name}** was updated (<{game_url}>)"
+                    f"🔧 **{name}** was updated "
+                    f"(<{game_url}>)"
                 )
 
             game_changed = True
@@ -297,15 +359,20 @@ def check_games(state):
         # -----------------------------------------------------------
 
         badge_data = get_json(
-            f"https://badges.roblox.com/v1/universes/{uid}/badges"
+            f"https://badges.roblox.com/v1/universes/"
+            f"{uid}/badges"
             f"?limit=100&sortOrder=Desc"
         )
 
         time.sleep(REQUEST_DELAY)
 
         if badge_data and "data" in badge_data:
+
             seen = set(
-                state["game_badges"].get(key, [])
+                state["game_badges"].get(
+                    key,
+                    []
+                )
             )
 
             current_ids = [
@@ -314,22 +381,30 @@ def check_games(state):
             ]
 
             new_badges = [
-                b for b in badge_data["data"]
+                b
+                for b in badge_data["data"]
                 if b["id"] not in seen
             ]
 
             if seen and new_badges:
-                for b in new_badges:
+
+                for badge in new_badges:
+
+                    badge_id = badge["id"]
 
                     alert_key = (
-                        f"new_badge:{uid}:{b['id']}"
+                        f"new_badge:{uid}:{badge_id}"
                     )
 
-                    if should_alert(state, alert_key):
+                    if should_alert(
+                        state,
+                        alert_key
+                    ):
                         alerts.append(
                             f"🏅 New badge in **{name}**: "
-                            f"*{b.get('name', 'Unknown')}* "
-                            f"(<https://www.roblox.com/badges/{b['id']}>)"
+                            f"*{badge.get('name', 'Unknown')}* "
+                            f"(<https://www.roblox.com/badges/"
+                            f"{badge_id}>)"
                         )
 
                     game_changed = True
@@ -337,7 +412,7 @@ def check_games(state):
             state["game_badges"][key] = current_ids
 
         # -----------------------------------------------------------
-        # Auto-add owner to online watchlist if game changed
+        # Auto-watch game owner
         # -----------------------------------------------------------
 
         if (
@@ -347,7 +422,10 @@ def check_games(state):
             and creator_id
         ):
             new_owner_watches.append(
-                (creator_id, creator_name)
+                (
+                    creator_id,
+                    creator_name
+                )
             )
 
     return alerts, new_owner_watches
@@ -361,8 +439,10 @@ def check_extra_badges(state):
     alerts = []
 
     for badge_id in config.EXTRA_BADGE_IDS:
+
         data = get_json(
-            f"https://badges.roblox.com/v1/badges/{badge_id}"
+            f"https://badges.roblox.com/v1/badges/"
+            f"{badge_id}"
         )
 
         time.sleep(REQUEST_DELAY)
@@ -382,26 +462,35 @@ def check_extra_badges(state):
 
         key = str(badge_id)
 
-        prev = state["badge_award_counts"].get(key)
+        previous = state[
+            "badge_award_counts"
+        ].get(key)
 
         if (
-            prev is not None
+            previous is not None
             and count is not None
-            and count > prev
+            and count > previous
         ):
             alert_key = (
-                f"extra_badge:{badge_id}:{count}"
+                f"extra_badge:{badge_id}"
             )
 
-            if should_alert(state, alert_key):
+            if should_alert(
+                state,
+                alert_key
+            ):
                 alerts.append(
-                    f"🏅 **{name}** was just earned by someone "
-                    f"(award count {prev} → {count}) "
-                    f"(<https://www.roblox.com/badges/{badge_id}>)"
+                    f"🏅 **{name}** was just earned "
+                    f"by someone "
+                    f"(award count {previous} → {count}) "
+                    f"(<https://www.roblox.com/badges/"
+                    f"{badge_id}>)"
                 )
 
         if count is not None:
-            state["badge_award_counts"][key] = count
+            state[
+                "badge_award_counts"
+            ][key] = count
 
     return alerts
 
@@ -416,15 +505,21 @@ def check_groups(state):
     for group_id, group_cfg in config.GROUPS.items():
 
         roles_data = get_json(
-            f"https://groups.roblox.com/v1/groups/{group_id}/roles"
+            f"https://groups.roblox.com/v1/groups/"
+            f"{group_id}/roles"
         )
 
         time.sleep(REQUEST_DELAY)
 
-        if not roles_data or "roles" not in roles_data:
+        if (
+            not roles_data
+            or "roles" not in roles_data
+        ):
             continue
 
-        wanted = set(group_cfg["roles"])
+        wanted = set(
+            group_cfg["roles"]
+        )
 
         for role in roles_data["roles"]:
 
@@ -432,15 +527,20 @@ def check_groups(state):
                 continue
 
             role_id = role["id"]
-            key = f"{group_id}:{role_id}"
+
+            key = (
+                f"{group_id}:{role_id}"
+            )
 
             members = []
             cursor = ""
 
             for _ in range(50):
+
                 url = (
-                    f"https://groups.roblox.com/v1/groups/{group_id}"
-                    f"/roles/{role_id}/users"
+                    f"https://groups.roblox.com/v1/"
+                    f"groups/{group_id}/roles/"
+                    f"{role_id}/users"
                     f"?limit=100&cursor={cursor}"
                 )
 
@@ -448,7 +548,10 @@ def check_groups(state):
 
                 time.sleep(REQUEST_DELAY)
 
-                if not data or "data" not in data:
+                if (
+                    not data
+                    or "data" not in data
+                ):
                     break
 
                 members.extend(
@@ -456,37 +559,54 @@ def check_groups(state):
                     for u in data["data"]
                 )
 
-                cursor = data.get("nextPageCursor")
+                cursor = data.get(
+                    "nextPageCursor"
+                )
 
                 if not cursor:
                     break
 
-            prev_members = set(
-                state["group_members"].get(key, [])
+            previous_members = set(
+                state["group_members"].get(
+                    key,
+                    []
+                )
             )
 
             new_members = [
-                m
-                for m in members
-                if m not in prev_members
+                uid
+                for uid in members
+                if uid not in previous_members
             ]
 
-            if prev_members and new_members:
+            if (
+                previous_members
+                and new_members
+            ):
 
                 for uid in new_members:
 
                     alert_key = (
-                        f"group_member:{group_id}:{role_id}:{uid}"
+                        f"group_member:"
+                        f"{group_id}:"
+                        f"{role_id}:"
+                        f"{uid}"
                     )
 
-                    if should_alert(state, alert_key):
+                    if should_alert(
+                        state,
+                        alert_key
+                    ):
                         alerts.append(
-                            f"⭐ New **{role['name']}** in "
-                            f"*{group_cfg['name']}*: "
-                            f"<https://www.roblox.com/users/{uid}/profile>"
+                            f"⭐ New **{role['name']}** "
+                            f"in *{group_cfg['name']}*: "
+                            f"<https://www.roblox.com/users/"
+                            f"{uid}/profile>"
                         )
 
-            state["group_members"][key] = members
+            state[
+                "group_members"
+            ][key] = members
 
     return alerts
 
@@ -496,12 +616,11 @@ def check_groups(state):
 # -------------------------------------------------------------------
 
 def resolve_usernames(usernames, state):
-    """Fill in state['user_ids'] for any usernames we haven't resolved yet."""
 
     missing = [
-        u
-        for u in usernames
-        if u not in state["user_ids"]
+        username
+        for username in usernames
+        if username not in state["user_ids"]
     ]
 
     for i in range(0, len(missing), 100):
@@ -509,43 +628,53 @@ def resolve_usernames(usernames, state):
         chunk = missing[i:i + 100]
 
         data = post_json(
-            "https://users.roblox.com/v1/usernames/users",
+            "https://users.roblox.com/v1/"
+            "usernames/users",
             {
                 "usernames": chunk,
                 "excludeBannedUsers": False
-            },
+            }
         )
 
         time.sleep(REQUEST_DELAY)
 
         if data and "data" in data:
 
-            for u in data["data"]:
-                state["user_ids"][
-                    u["requestedUsername"]
-                ] = u["id"]
+            for user in data["data"]:
+
+                state[
+                    "user_ids"
+                ][
+                    user["requestedUsername"]
+                ] = user["id"]
 
 
 def resolve_extra_user_ids(state):
-    """Fill in display names for config.EXTRA_USER_IDS."""
 
     for uid in config.EXTRA_USER_IDS:
 
         key = str(uid)
 
-        if key in state["extra_user_names"]:
+        if key in state[
+            "extra_user_names"
+        ]:
             continue
 
         data = get_json(
-            f"https://users.roblox.com/v1/users/{uid}"
+            f"https://users.roblox.com/v1/users/"
+            f"{uid}"
         )
 
         time.sleep(REQUEST_DELAY)
 
         if data and "name" in data:
-            state["extra_user_names"][key] = data["name"]
+            state[
+                "extra_user_names"
+            ][key] = data["name"]
         else:
-            state["extra_user_names"][key] = f"User {uid}"
+            state[
+                "extra_user_names"
+            ][key] = f"User {uid}"
 
 
 def check_online(state, extra_users):
@@ -556,19 +685,23 @@ def check_online(state, extra_users):
         state
     )
 
-    resolve_extra_user_ids(state)
+    resolve_extra_user_ids(
+        state
+    )
 
     watch_ids = {}
 
-    # Usernames
-    for uname in config.WATCH_USERNAMES:
+    # Config usernames.
+    for username in config.WATCH_USERNAMES:
 
-        uid = state["user_ids"].get(uname)
+        uid = state[
+            "user_ids"
+        ].get(username)
 
         if uid:
-            watch_ids[uid] = uname
+            watch_ids[uid] = username
 
-    # Directly-watched user IDs
+    # Directly watched IDs.
     for uid in config.EXTRA_USER_IDS:
 
         watch_ids[uid] = state[
@@ -578,25 +711,27 @@ def check_online(state, extra_users):
             f"User {uid}"
         )
 
-    # Dynamically-added game owners
-    for uid, uname in state[
+    # Dynamically watched owners.
+    for uid, username in state[
         "dynamic_watch_users"
     ].items():
 
-        watch_ids[int(uid)] = uname
+        watch_ids[int(uid)] = username
 
-    # Newly discovered owners
-    for uid, uname in extra_users:
+    # Newly discovered owners.
+    for uid, username in extra_users:
 
         if uid not in watch_ids:
 
-            watch_ids[uid] = uname
+            watch_ids[uid] = username
 
             state[
                 "dynamic_watch_users"
-            ][str(uid)] = uname
+            ][str(uid)] = username
 
-    all_ids = list(watch_ids.keys())
+    all_ids = list(
+        watch_ids.keys()
+    )
 
     online_now = set()
 
@@ -605,28 +740,36 @@ def check_online(state, extra_users):
         chunk = all_ids[i:i + 100]
 
         data = post_json(
-            "https://presence.roblox.com/v1/presence/users",
-            {"userIds": chunk}
+            "https://presence.roblox.com/v1/"
+            "presence/users",
+            {
+                "userIds": chunk
+            }
         )
 
         time.sleep(REQUEST_DELAY)
 
-        if data and "userPresences" in data:
+        if (
+            data
+            and "userPresences" in data
+        ):
 
-            for p in data["userPresences"]:
+            for presence in data[
+                "userPresences"
+            ]:
 
                 # 0 = Offline
                 # 1 = Online
                 # 2 = InGame
                 # 3 = InStudio
 
-                if p.get(
+                if presence.get(
                     "userPresenceType",
                     0
                 ) != 0:
 
                     online_now.add(
-                        p["userId"]
+                        presence["userId"]
                     )
 
     for uid in all_ids:
@@ -642,15 +785,19 @@ def check_online(state, extra_users):
 
         if is_online and not was_online:
 
-            alert_key = f"user_online:{uid}"
+            alert_key = (
+                f"user_online:{uid}"
+            )
 
             if should_alert(
                 state,
                 alert_key
             ):
                 alerts.append(
-                    f"🟢 **{watch_ids[uid]}** just came online "
-                    f"(<https://www.roblox.com/users/{uid}/profile>)"
+                    f"🟢 **{watch_ids[uid]}** "
+                    f"just came online "
+                    f"(<https://www.roblox.com/users/"
+                    f"{uid}/profile>)"
                 )
 
         state[
@@ -661,7 +808,7 @@ def check_online(state, extra_users):
 
 
 # -------------------------------------------------------------------
-# main
+# Main
 # -------------------------------------------------------------------
 
 def main():
@@ -699,8 +846,8 @@ def main():
         new_owner_watches
     )
 
-    # Save everything, including cooldown timestamps,
-    # before sending the Discord messages.
+    # Save state BEFORE sending Discord messages.
+    # This includes the cooldown timestamps.
     save_state(state)
 
     send_to_discord(
@@ -730,9 +877,6 @@ def main():
         f"Run finished at {now_iso()}."
     )
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
