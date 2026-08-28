@@ -34,7 +34,10 @@ GAME_PLACE_IDS = [
     316624534, 4746308994, 3161352649, 2983623754, 96923836994493,
     12141611336, 14619285685, 2011273269, 2065821410, 6069595082,
     2986558181, 5567471806, 9041405753, 2610191817, 18435782607,
-    12994826267, 71591683104334, 9009139090, 13273713934, 13275045990
+    12994826267, 71591683104334, 9009139090, 13273713934, 13275045990,
+    100123847518052, 133638085148153, 127669292683496, 10536632997,
+    9090640493, 16853615558, 15039147264, 17429324487, 7407349577,
+    13266544419, 726982743, 2485519908, 5162593998
 ]
 
 # ---- Specific badge IDs to watch directly (not tied to a tracked game) ----
@@ -59,7 +62,8 @@ WATCH_USERNAMES = [
     "RobertSmiles", "DanStickman", "SethSmiIes", "MatthewJSmiles",
     "ClairJSmiles", "LemonB0yy", "AscendentOne", "Osimker", "HeadOfTaCo",
     "therulerofnothing", "Littlenathanial", "Bobbys_Here", "MrRealism",
-    "Taupea", "holovilleMentor"
+    "Taupea", "holovilleMentor", "ColorlessOvercast", "Orenen", "Valorna",
+    "LenzCult"
 ]
 
 # ---- Groups + exact rank names to watch for new members ----
