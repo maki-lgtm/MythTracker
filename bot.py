@@ -9,6 +9,8 @@ Checks, once per run:
 Sends everything it finds to a Discord webhook, then saves what it saw
 to state.json so next run only reports NEW stuff.
 
+Alerts for the same exact event are limited to once every 30 minutes.
+
 You should not need to edit this file. Edit config.py to change what's
 tracked. See README.md for setup instructions.
 """
@@ -16,10 +18,9 @@ tracked. See README.md for setup instructions.
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
-
 import config
 
 
@@ -30,6 +31,9 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "myth-hunting-bot/1.0"})
 
 REQUEST_DELAY = 0.4  # small pause between calls to be gentle on Roblox's API
+
+# Same exact event cannot be announced more than once during this period.
+ALERT_COOLDOWN_MINUTES = 30
 
 
 # -------------------------------------------------------------------
@@ -45,7 +49,7 @@ def get_json(url, **kwargs):
             if resp.status_code == 200:
                 return resp.json()
 
-            if resp.status_code == 429:  # rate limited, back off and retry
+            if resp.status_code == 429:
                 time.sleep(2 + attempt * 2)
                 continue
 
@@ -80,7 +84,14 @@ def post_json(url, payload):
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            state = json.load(f)
+
+        # Add the cooldown dictionary if this is an older state.json
+        # that was created before cooldown support existed.
+        if "alert_cooldowns" not in state:
+            state["alert_cooldowns"] = {}
+
+        return state
 
     return {
         "place_to_universe": {},   # placeId -> universeId
@@ -92,6 +103,9 @@ def load_state():
         "dynamic_watch_users": {}, # userId -> username, added from game owners
         "badge_award_counts": {},  # badgeId -> last known awardedCount
         "extra_user_names": {},    # userId -> resolved display name
+
+        # alert key -> ISO timestamp of the last time it was announced
+        "alert_cooldowns": {},
     }
 
 
@@ -105,12 +119,53 @@ def now_iso():
 
 
 # -------------------------------------------------------------------
+# Alert cooldown
+# -------------------------------------------------------------------
+
+def should_alert(state, alert_key):
+    """
+    Return True if this exact alert is allowed to be sent.
+
+    The same alert key can only be announced once every
+    ALERT_COOLDOWN_MINUTES minutes.
+    """
+
+    cooldowns = state.setdefault("alert_cooldowns", {})
+
+    previous = cooldowns.get(alert_key)
+
+    if previous:
+        try:
+            previous_time = datetime.fromisoformat(previous)
+
+            # Make sure old timestamps without timezone information
+            # don't cause comparison errors.
+            if previous_time.tzinfo is None:
+                previous_time = previous_time.replace(tzinfo=timezone.utc)
+
+            age = datetime.now(timezone.utc) - previous_time
+
+            if age < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return False
+
+        except (ValueError, TypeError):
+            # If an old/broken timestamp exists, allow the alert.
+            pass
+
+    # Record the time this alert was allowed.
+    cooldowns[alert_key] = now_iso()
+
+    return True
+
+
+# -------------------------------------------------------------------
 # Discord
 # -------------------------------------------------------------------
 
 def send_to_discord(lines, title):
     """Send a batch of alert lines to Discord, chunked to stay under
     Discord's per-message character limit."""
+
     if not lines or not WEBHOOK_URL:
         return
 
@@ -132,8 +187,13 @@ def send_to_discord(lines, title):
 
     for c in chunks:
         content = f"**{title}**\n" + "\n".join(c)
-        post_json(WEBHOOK_URL, {"content": content})
-        time.sleep(1)  # stay well under Discord's rate limit
+
+        post_json(
+            WEBHOOK_URL,
+            {"content": content}
+        )
+
+        time.sleep(1)
 
 
 # -------------------------------------------------------------------
@@ -161,7 +221,7 @@ def resolve_universe_id(place_id, state):
 
 def check_games(state):
     alerts = []
-    new_owner_watches = []  # list of (userId, username) to auto-add to online watch
+    new_owner_watches = []
 
     # Resolve all universe IDs first
     universe_ids = []
@@ -201,13 +261,17 @@ def check_games(state):
         creator = info.get("creator", {})
         creator_id = creator.get("id")
         creator_name = creator.get("name")
-        creator_type = creator.get("type")  # "User" or "Group"
+        creator_type = creator.get("type")
 
         key = str(uid)
+
         prev_updated = state["game_updated"].get(key)
         game_changed = False
 
+        # -----------------------------------------------------------
         # Game update check
+        # -----------------------------------------------------------
+
         if prev_updated is not None and updated and updated != prev_updated:
             root_place_id = info.get("rootPlaceId")
 
@@ -217,15 +281,21 @@ def check_games(state):
                 else f"https://www.roblox.com/games/{uid}"
             )
 
-            alerts.append(
-                f"🔧 **{name}** was updated (<{game_url}>)"
-            )
+            alert_key = f"game_update:{uid}:{updated}"
+
+            if should_alert(state, alert_key):
+                alerts.append(
+                    f"🔧 **{name}** was updated (<{game_url}>)"
+                )
 
             game_changed = True
 
         state["game_updated"][key] = updated
 
+        # -----------------------------------------------------------
         # Badges
+        # -----------------------------------------------------------
+
         badge_data = get_json(
             f"https://badges.roblox.com/v1/universes/{uid}/badges"
             f"?limit=100&sortOrder=Desc"
@@ -234,28 +304,42 @@ def check_games(state):
         time.sleep(REQUEST_DELAY)
 
         if badge_data and "data" in badge_data:
-            seen = set(state["game_badges"].get(key, []))
+            seen = set(
+                state["game_badges"].get(key, [])
+            )
 
-            current_ids = [b["id"] for b in badge_data["data"]]
+            current_ids = [
+                b["id"]
+                for b in badge_data["data"]
+            ]
 
             new_badges = [
                 b for b in badge_data["data"]
                 if b["id"] not in seen
             ]
 
-            if seen and new_badges:  # don't alert on the very first run
+            if seen and new_badges:
                 for b in new_badges:
-                    alerts.append(
-                        f"🏅 New badge in **{name}**: "
-                        f"*{b.get('name', 'Unknown')}* "
-                        f"(<https://www.roblox.com/badges/{b['id']}>)"
+
+                    alert_key = (
+                        f"new_badge:{uid}:{b['id']}"
                     )
 
-                game_changed = True
+                    if should_alert(state, alert_key):
+                        alerts.append(
+                            f"🏅 New badge in **{name}**: "
+                            f"*{b.get('name', 'Unknown')}* "
+                            f"(<https://www.roblox.com/badges/{b['id']}>)"
+                        )
+
+                    game_changed = True
 
             state["game_badges"][key] = current_ids
 
-        # Auto-add owner to the online watchlist if this game changed
+        # -----------------------------------------------------------
+        # Auto-add owner to online watchlist if game changed
+        # -----------------------------------------------------------
+
         if (
             game_changed
             and config.AUTO_WATCH_GAME_OWNERS
@@ -270,7 +354,7 @@ def check_games(state):
 
 
 # -------------------------------------------------------------------
-# 1b. Specific standalone badges (not tied to a tracked game)
+# 1b. Specific standalone badges
 # -------------------------------------------------------------------
 
 def check_extra_badges(state):
@@ -286,18 +370,35 @@ def check_extra_badges(state):
         if not data:
             continue
 
-        name = data.get("name", f"Badge {badge_id}")
-        count = data.get("statistics", {}).get("awardedCount")
+        name = data.get(
+            "name",
+            f"Badge {badge_id}"
+        )
+
+        count = data.get(
+            "statistics",
+            {}
+        ).get("awardedCount")
 
         key = str(badge_id)
+
         prev = state["badge_award_counts"].get(key)
 
-        if prev is not None and count is not None and count > prev:
-            alerts.append(
-                f"🏅 **{name}** was just earned by someone "
-                f"(award count {prev} → {count}) "
-                f"(<https://www.roblox.com/badges/{badge_id}>)"
+        if (
+            prev is not None
+            and count is not None
+            and count > prev
+        ):
+            alert_key = (
+                f"extra_badge:{badge_id}:{count}"
             )
+
+            if should_alert(state, alert_key):
+                alerts.append(
+                    f"🏅 **{name}** was just earned by someone "
+                    f"(award count {prev} → {count}) "
+                    f"(<https://www.roblox.com/badges/{badge_id}>)"
+                )
 
         if count is not None:
             state["badge_award_counts"][key] = count
@@ -313,6 +414,7 @@ def check_groups(state):
     alerts = []
 
     for group_id, group_cfg in config.GROUPS.items():
+
         roles_data = get_json(
             f"https://groups.roblox.com/v1/groups/{group_id}/roles"
         )
@@ -325,6 +427,7 @@ def check_groups(state):
         wanted = set(group_cfg["roles"])
 
         for role in roles_data["roles"]:
+
             if role["name"] not in wanted:
                 continue
 
@@ -334,7 +437,7 @@ def check_groups(state):
             members = []
             cursor = ""
 
-            for _ in range(50):  # safety cap on pagination
+            for _ in range(50):
                 url = (
                     f"https://groups.roblox.com/v1/groups/{group_id}"
                     f"/roles/{role_id}/users"
@@ -349,7 +452,8 @@ def check_groups(state):
                     break
 
                 members.extend(
-                    u["userId"] for u in data["data"]
+                    u["userId"]
+                    for u in data["data"]
                 )
 
                 cursor = data.get("nextPageCursor")
@@ -362,17 +466,25 @@ def check_groups(state):
             )
 
             new_members = [
-                m for m in members
+                m
+                for m in members
                 if m not in prev_members
             ]
 
-            if prev_members and new_members:  # skip alert on first run
+            if prev_members and new_members:
+
                 for uid in new_members:
-                    alerts.append(
-                        f"⭐ New **{role['name']}** in "
-                        f"*{group_cfg['name']}*: "
-                        f"<https://www.roblox.com/users/{uid}/profile>"
+
+                    alert_key = (
+                        f"group_member:{group_id}:{role_id}:{uid}"
                     )
+
+                    if should_alert(state, alert_key):
+                        alerts.append(
+                            f"⭐ New **{role['name']}** in "
+                            f"*{group_cfg['name']}*: "
+                            f"<https://www.roblox.com/users/{uid}/profile>"
+                        )
 
             state["group_members"][key] = members
 
@@ -385,12 +497,15 @@ def check_groups(state):
 
 def resolve_usernames(usernames, state):
     """Fill in state['user_ids'] for any usernames we haven't resolved yet."""
+
     missing = [
-        u for u in usernames
+        u
+        for u in usernames
         if u not in state["user_ids"]
     ]
 
     for i in range(0, len(missing), 100):
+
         chunk = missing[i:i + 100]
 
         data = post_json(
@@ -404,6 +519,7 @@ def resolve_usernames(usernames, state):
         time.sleep(REQUEST_DELAY)
 
         if data and "data" in data:
+
             for u in data["data"]:
                 state["user_ids"][
                     u["requestedUsername"]
@@ -411,10 +527,10 @@ def resolve_usernames(usernames, state):
 
 
 def resolve_extra_user_ids(state):
-    """Fill in display names for config.EXTRA_USER_IDS
-    (watched by ID, not username)."""
+    """Fill in display names for config.EXTRA_USER_IDS."""
 
     for uid in config.EXTRA_USER_IDS:
+
         key = str(uid)
 
         if key in state["extra_user_names"]:
@@ -442,35 +558,50 @@ def check_online(state, extra_users):
 
     resolve_extra_user_ids(state)
 
-    watch_ids = {}  # userId -> display name
+    watch_ids = {}
 
+    # Usernames
     for uname in config.WATCH_USERNAMES:
+
         uid = state["user_ids"].get(uname)
 
         if uid:
             watch_ids[uid] = uname
 
-    # directly-watched user IDs
-    # (from profile links, not usernames)
+    # Directly-watched user IDs
     for uid in config.EXTRA_USER_IDS:
-        watch_ids[uid] = state["extra_user_names"].get(
+
+        watch_ids[uid] = state[
+            "extra_user_names"
+        ].get(
             str(uid),
             f"User {uid}"
         )
 
-    # merge in dynamically-added game owners
-    for uid, uname in state["dynamic_watch_users"].items():
+    # Dynamically-added game owners
+    for uid, uname in state[
+        "dynamic_watch_users"
+    ].items():
+
         watch_ids[int(uid)] = uname
 
+    # Newly discovered owners
     for uid, uname in extra_users:
+
         if uid not in watch_ids:
+
             watch_ids[uid] = uname
-            state["dynamic_watch_users"][str(uid)] = uname
+
+            state[
+                "dynamic_watch_users"
+            ][str(uid)] = uname
 
     all_ids = list(watch_ids.keys())
+
     online_now = set()
 
     for i in range(0, len(all_ids), 100):
+
         chunk = all_ids[i:i + 100]
 
         data = post_json(
@@ -481,17 +612,28 @@ def check_online(state, extra_users):
         time.sleep(REQUEST_DELAY)
 
         if data and "userPresences" in data:
+
             for p in data["userPresences"]:
-                # userPresenceType:
+
                 # 0 = Offline
                 # 1 = Online
                 # 2 = InGame
                 # 3 = InStudio
-                if p.get("userPresenceType", 0) != 0:
-                    online_now.add(p["userId"])
+
+                if p.get(
+                    "userPresenceType",
+                    0
+                ) != 0:
+
+                    online_now.add(
+                        p["userId"]
+                    )
 
     for uid in all_ids:
-        was_online = state["user_online"].get(
+
+        was_online = state[
+            "user_online"
+        ].get(
             str(uid),
             False
         )
@@ -499,12 +641,21 @@ def check_online(state, extra_users):
         is_online = uid in online_now
 
         if is_online and not was_online:
-            alerts.append(
-                f"🟢 **{watch_ids[uid]}** just came online "
-                f"(<https://www.roblox.com/users/{uid}/profile>)"
-            )
 
-        state["user_online"][str(uid)] = is_online
+            alert_key = f"user_online:{uid}"
+
+            if should_alert(
+                state,
+                alert_key
+            ):
+                alerts.append(
+                    f"🟢 **{watch_ids[uid]}** just came online "
+                    f"(<https://www.roblox.com/users/{uid}/profile>)"
+                )
+
+        state[
+            "user_online"
+        ][str(uid)] = is_online
 
     return alerts
 
@@ -514,6 +665,7 @@ def check_online(state, extra_users):
 # -------------------------------------------------------------------
 
 def main():
+
     if not WEBHOOK_URL:
         print(
             "WARNING: DISCORD_WEBHOOK_URL is not set — "
@@ -523,20 +675,32 @@ def main():
     state = load_state()
 
     print("Checking games...")
-    game_alerts, new_owner_watches = check_games(state)
+
+    game_alerts, new_owner_watches = check_games(
+        state
+    )
 
     print("Checking standalone badges...")
-    badge_alerts = check_extra_badges(state)
+
+    badge_alerts = check_extra_badges(
+        state
+    )
 
     print("Checking groups...")
-    group_alerts = check_groups(state)
+
+    group_alerts = check_groups(
+        state
+    )
 
     print("Checking online status...")
+
     online_alerts = check_online(
         state,
         new_owner_watches
     )
 
+    # Save everything, including cooldown timestamps,
+    # before sending the Discord messages.
     save_state(state)
 
     send_to_discord(
@@ -566,6 +730,9 @@ def main():
         f"Run finished at {now_iso()}."
     )
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
