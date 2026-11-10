@@ -98,67 +98,7 @@ WATCH_USERNAMES = [
     "GrandpaCult", "Antharkhot"
 ]
 
-# ---- Groups + exact rank names to watch for new members ----
-# groupId -> list of role names (must match the role name on Roblox exactly)
-GROUPS = {
-    619142: {
-        "name": "Robloxian Myth Hunters",
-        "roles": [
-            "-[Myth Emeritus]-",
-            "-[Established Myth]-",
-            "-[Proficient Myth]-",
-            "-[Acclaimed Myth]-",
-            "-[Myth Legend]-",
-        ],
-    },
-    4311527: {
-        "name": "RMH Myth Development",
-        "roles": [
-            "Myth in Development",
-            "Upcoming Myth",
-            "Adept Myth",
-            "Qualified Myth",
-            "Myth Veteran",
-        ],
-    },
-    10218177: {
-        "name": "Banana Myths",
-        "roles": [
-            "Legacy Myth",
-            "Developing Myth",
-            "Myth",
-            "Amazing Myth",
-            "Astounding Myth",
-        ],
-    },
-    33083768: {
-        "name": "Roblox Myths 2",
-        "roles": [
-            ":Beginner Myths:",
-            ":Small Myths:",
-            ":Growing Myths:",
-            ":Popular Myths:",
-        ],
-    },
-    36037522: {
-        "name": "ANTIQUES MYTHS",
-        "roles": [
-            "Noticed Myths",
-            "Well-Known Myths",
-            "Established Myths",
-            "Impressive Myths",
-        ],
-    },
-    732128479: {
-        "name": "Kylos Myth Directive",
-        "roles": [
-            "Lesser Myth",
-            "Established Myth",
-            "Notable Myth",
-            "Etched Myth",
-        ],
-    },
-}
+
 
 # If a tracked game gets a new badge or an update, its owner is
 # automatically added to the "online" watchlist too (in addition to
