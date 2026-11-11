@@ -1,18 +1,17 @@
+
 """
 Roblox Myth-Hunting Bot
 =======================
 Checks, once per run:
-  1. Tracked games -> new badges + game updates (and remembers the owner)
-  2. Tracked group ranks -> new members
-  3. Watched usernames (+ owners auto-added from #1) -> who just came online
+  1. Tracked games -> new badges + game updates
+  2. Watched usernames + IDs -> who just came online
+  3. Game owners -> automatically added to online monitoring
 
-Sends everything it finds to a Discord webhook, then saves what it saw
-to state.json so next run only reports NEW stuff.
+Sends notifications to Discord and saves state in state.json.
 
-The same exact event cannot be announced more than once every 30 minutes.
-
-You should not need to edit this file.
-Edit config.py to change what's tracked.
+Failed Discord notifications remain queued for future attempts.
+The same successfully announced event cannot be announced again
+within 30 minutes.
 """
 
 import json
@@ -29,122 +28,163 @@ WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "myth-hunting-bot/1.0"
+    "User-Agent": "myth-hunting-bot/2.0"
 })
 
 REQUEST_DELAY = 0.4
-
-# Same event cannot be announced again during this period.
 ALERT_COOLDOWN_MINUTES = 30
+MAX_RETRIES = 3
 
 
-# -------------------------------------------------------------------
-# HTTP helpers
-# -------------------------------------------------------------------
+# =============================================================
+# HTTP HELPERS
+# =============================================================
 
-def get_json(url, **kwargs):
-    """GET a URL and return parsed JSON, with basic retry on failure."""
-    for attempt in range(3):
+def request_with_retry(method, url, **kwargs):
+    """Perform an HTTP request with retry and rate-limit handling."""
+
+    for attempt in range(MAX_RETRIES):
         try:
-            resp = SESSION.get(url, timeout=15, **kwargs)
+            response = SESSION.request(
+                method,
+                url,
+                timeout=20,
+                **kwargs
+            )
 
-            if resp.status_code == 200:
-                return resp.json()
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
 
-            if resp.status_code == 429:
-                time.sleep(2 + attempt * 2)
+                try:
+                    delay = float(retry_after)
+                except (ValueError, TypeError):
+                    delay = 2 + attempt * 2
+
+                print(f"Rate limited. Waiting {delay} seconds.")
+                time.sleep(delay)
                 continue
 
-            return None
+            if response.status_code >= 500:
+                print(
+                    f"Server error {response.status_code}: {url}"
+                )
+                time.sleep(1 + attempt)
+                continue
 
-        except requests.RequestException:
+            return response
+
+        except requests.RequestException as error:
+            print(f"Request failed: {error}")
             time.sleep(1 + attempt)
 
+    print(f"Request permanently failed: {url}")
     return None
+
+
+def get_json(url, **kwargs):
+    """GET JSON from an API."""
+
+    response = request_with_retry("GET", url, **kwargs)
+
+    if response is None or response.status_code != 200:
+        return None
+
+    try:
+        return response.json()
+    except ValueError:
+        print(f"Invalid JSON response: {url}")
+        return None
 
 
 def post_json(url, payload):
-    """POST JSON and return parsed JSON, with basic retry."""
-    for attempt in range(3):
-        try:
-            resp = SESSION.post(
-                url,
-                json=payload,
-                timeout=15
-            )
+    """POST JSON to an API."""
 
-            if resp.status_code == 200:
-                return resp.json()
+    response = request_with_retry(
+        "POST",
+        url,
+        json=payload
+    )
 
-            if resp.status_code == 204:
-                return {}
+    if response is None:
+        return None
 
-            if resp.status_code == 429:
-                time.sleep(2 + attempt * 2)
-                continue
+    if response.status_code not in (200, 201):
+        return None
 
-            return None
-
-        except requests.RequestException:
-            time.sleep(1 + attempt)
-
-    return None
+    try:
+        return response.json()
+    except ValueError:
+        return {}
 
 
-# -------------------------------------------------------------------
-# State
-# -------------------------------------------------------------------
+# =============================================================
+# STATE
+# =============================================================
 
 def load_state():
+
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
+
         except (json.JSONDecodeError, OSError):
+            print("WARNING: Could not read state.json.")
             state = {}
+
     else:
         state = {}
 
-    # Make sure every required section exists.
-    state.setdefault("place_to_universe", {})
-    state.setdefault("game_badges", {})
-    state.setdefault("game_updated", {})
-    state.setdefault("group_members", {})
-    state.setdefault("user_ids", {})
-    state.setdefault("user_online", {})
-    state.setdefault("dynamic_watch_users", {})
-    state.setdefault("badge_award_counts", {})
-    state.setdefault("extra_user_names", {})
-    state.setdefault("alert_cooldowns", {})
+    required_sections = {
+        "place_to_universe": {},
+        "game_badges": {},
+        "game_updated": {},
+        "user_ids": {},
+        "user_online": {},
+        "dynamic_watch_users": {},
+        "badge_award_counts": {},
+        "extra_user_names": {},
+        "alert_cooldowns": {},
+        "pending_alerts": []
+    }
+
+    for key, default in required_sections.items():
+        state.setdefault(key, default)
+
+    # Ensure pending alerts have the expected structure.
+    if not isinstance(state["pending_alerts"], list):
+        state["pending_alerts"] = []
 
     return state
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
+
+    temporary_file = STATE_FILE + ".tmp"
+
+    with open(temporary_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+    os.replace(temporary_file, STATE_FILE)
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-# -------------------------------------------------------------------
-# Alert cooldown
-# -------------------------------------------------------------------
+# =============================================================
+# ALERT QUEUE AND COOLDOWNS
+# =============================================================
 
-def should_alert(state, alert_key):
+def enqueue_alert(state, alert_key, title, line):
     """
-    Return True if this alert is allowed to be announced.
+    Add an alert to the persistent queue.
 
-    The same alert key can only be announced once every
-    ALERT_COOLDOWN_MINUTES minutes.
+    An event is not considered announced until Discord
+    successfully accepts its notification.
     """
 
-    cooldowns = state.setdefault(
-        "alert_cooldowns",
-        {}
-    )
+    cooldowns = state["alert_cooldowns"]
 
     previous = cooldowns.get(alert_key)
 
@@ -159,70 +199,148 @@ def should_alert(state, alert_key):
 
             age = datetime.now(timezone.utc) - previous_time
 
-            if age < timedelta(
-                minutes=ALERT_COOLDOWN_MINUTES
-            ):
-                print(
-                    f"Cooldown active for {alert_key}; "
-                    f"skipping alert."
-                )
-                return False
+            if age < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
 
         except (ValueError, TypeError):
             pass
 
-    # Record the time this event was allowed.
-    cooldowns[alert_key] = now_iso()
+    # Don't queue the same event more than once.
+    for pending in state["pending_alerts"]:
+        if pending.get("key") == alert_key:
+            return
 
-    return True
+    state["pending_alerts"].append({
+        "key": alert_key,
+        "title": title,
+        "line": line
+    })
 
 
-# -------------------------------------------------------------------
-# Discord
-# -------------------------------------------------------------------
+def send_discord_message(content):
+    """Send a Discord message and confirm successful delivery."""
 
-def send_to_discord(lines, title):
-    """Send alert lines to Discord in safe-sized messages."""
+    if not WEBHOOK_URL:
+        return False
 
-    if not lines or not WEBHOOK_URL:
+    response = request_with_retry(
+        "POST",
+        WEBHOOK_URL,
+        json={
+            "content": content,
+            "allowed_mentions": {
+                "parse": []
+            }
+        }
+    )
+
+    if response is None:
+        return False
+
+    if response.status_code in (200, 204):
+        return True
+
+    print(
+        f"Discord delivery failed: HTTP {response.status_code}"
+    )
+
+    return False
+
+
+def deliver_pending_alerts(state):
+    """
+    Deliver queued notifications.
+
+    Successfully delivered alerts are removed from the queue
+    and receive their cooldown timestamp.
+
+    Failed notifications remain queued.
+    """
+
+    if not state["pending_alerts"]:
         return
 
-    chunk = []
-    chunk_len = 0
-    chunks = []
+    if not WEBHOOK_URL:
+        print("Discord webhook missing. Alerts remain queued.")
+        return
 
-    for line in lines:
-        # Keep messages comfortably below Discord's limit.
-        if chunk and chunk_len + len(line) > 1800:
-            chunks.append(chunk)
-            chunk = []
-            chunk_len = 0
+    titles = []
 
-        chunk.append(line)
-        chunk_len += len(line)
+    for alert in state["pending_alerts"]:
+        if alert["title"] not in titles:
+            titles.append(alert["title"])
 
-    if chunk:
-        chunks.append(chunk)
+    for title in titles:
 
-    for c in chunks:
-        content = (
-            f"**{title}**\n"
-            + "\n".join(c)
-        )
+        matching = [
+            alert
+            for alert in state["pending_alerts"]
+            if alert["title"] == title
+        ]
 
-        post_json(
-            WEBHOOK_URL,
-            {"content": content}
-        )
+        chunks = []
+        current_chunk = []
 
-        time.sleep(1)
+        for alert in matching:
+
+            line = alert["line"]
+
+            # Keep messages comfortably below Discord's limit.
+            if current_chunk and (
+                sum(len(a["line"]) + 1 for a in current_chunk)
+                + len(line) > 1700
+            ):
+                chunks.append(current_chunk)
+                current_chunk = []
+
+            current_chunk.append(alert)
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        for chunk in chunks:
+
+            content = (
+                f"**{title}**\n"
+                + "\n".join(a["line"] for a in chunk)
+            )
+
+            success = send_discord_message(content)
+
+            if not success:
+                print(
+                    f"Failed to deliver {len(chunk)} alert(s). "
+                    "They will be retried."
+                )
+                continue
+
+            delivered_keys = {
+                alert["key"] for alert in chunk
+            }
+
+            for alert in chunk:
+                state["alert_cooldowns"][alert["key"]] = now_iso()
+
+            state["pending_alerts"] = [
+                alert
+                for alert in state["pending_alerts"]
+                if alert["key"] not in delivered_keys
+            ]
+
+            # Persist each successful delivery immediately.
+            save_state(state)
+
+            print(f"Delivered {len(chunk)} alert(s).")
+
+            time.sleep(1)
 
 
-# -------------------------------------------------------------------
-# 1. Games: badges + updates
-# -------------------------------------------------------------------
+# =============================================================
+# 1. GAMES: BADGES + UPDATES
+# =============================================================
 
 def resolve_universe_id(place_id, state):
+
     key = str(place_id)
 
     if key in state["place_to_universe"]:
@@ -236,49 +354,105 @@ def resolve_universe_id(place_id, state):
     time.sleep(REQUEST_DELAY)
 
     if data and "universeId" in data:
-        state["place_to_universe"][key] = data["universeId"]
-        return data["universeId"]
+
+        universe_id = data["universeId"]
+
+        state["place_to_universe"][key] = universe_id
+
+        return universe_id
 
     return None
 
 
+def fetch_all_game_badges(universe_id):
+    """
+    Retrieve every badge belonging to a game.
+
+    Returns:
+        list: Successfully retrieved badges.
+        None: If any page fails.
+    """
+
+    badges = []
+    cursor = None
+    seen_cursors = set()
+
+    while True:
+
+        params = {
+            "limit": 100,
+            "sortOrder": "Desc"
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        data = get_json(
+            f"https://badges.roblox.com/v1/universes/"
+            f"{universe_id}/badges",
+            params=params
+        )
+
+        time.sleep(REQUEST_DELAY)
+
+        if not data or "data" not in data:
+            return None
+
+        badges.extend(data["data"])
+
+        cursor = data.get("nextPageCursor")
+
+        if not cursor:
+            break
+
+        # Prevent an accidental infinite pagination loop.
+        if cursor in seen_cursors:
+            print(f"Repeated badge cursor for game {universe_id}.")
+            return None
+
+        seen_cursors.add(cursor)
+
+    return badges
+
+
 def check_games(state):
-    alerts = []
-    new_owner_watches = []
+
+    game_ids = list(dict.fromkeys(config.GAME_PLACE_IDS))
 
     universe_ids = []
 
-    # Resolve all universe IDs first.
-    for place_id in config.GAME_PLACE_IDS:
-        uid = resolve_universe_id(
-            place_id,
-            state
-        )
+    # Resolve universe IDs.
+    for place_id in game_ids:
 
-        if uid:
+        uid = resolve_universe_id(place_id, state)
+
+        if uid and uid not in universe_ids:
             universe_ids.append(uid)
 
     # Fetch game information in chunks of 50.
     game_info = {}
 
     for i in range(0, len(universe_ids), 50):
+
         chunk = universe_ids[i:i + 50]
 
-        ids_param = ",".join(
-            str(u)
-            for u in chunk
-        )
+        ids_param = ",".join(str(uid) for uid in chunk)
 
         data = get_json(
-            f"https://games.roblox.com/v1/games"
-            f"?universeIds={ids_param}"
+            "https://games.roblox.com/v1/games",
+            params={
+                "universeIds": ids_param
+            }
         )
 
         time.sleep(REQUEST_DELAY)
 
         if data and "data" in data:
+
             for game in data["data"]:
                 game_info[game["id"]] = game
+
+    new_owner_watches = []
 
     for uid in universe_ids:
 
@@ -287,17 +461,10 @@ def check_games(state):
         if not info:
             continue
 
-        name = info.get(
-            "name",
-            f"Universe {uid}"
-        )
-
+        name = info.get("name", f"Universe {uid}")
         updated = info.get("updated")
 
-        creator = info.get(
-            "creator",
-            {}
-        )
+        creator = info.get("creator") or {}
 
         creator_id = creator.get("id")
         creator_name = creator.get("name")
@@ -305,115 +472,101 @@ def check_games(state):
 
         key = str(uid)
 
-        previous_updated = state[
-            "game_updated"
-        ].get(key)
-
         game_changed = False
 
-        # -----------------------------------------------------------
+        # -----------------------------------------------------
         # Game update check
-        # -----------------------------------------------------------
+        # -----------------------------------------------------
+
+        previous_updated = state["game_updated"].get(key)
 
         if (
             previous_updated is not None
             and updated
             and updated != previous_updated
         ):
-            root_place_id = info.get(
-                "rootPlaceId"
-            )
+
+            root_place_id = info.get("rootPlaceId")
 
             if root_place_id:
                 game_url = (
-                    f"https://www.roblox.com/games/"
-                    f"{root_place_id}"
+                    f"https://www.roblox.com/games/{root_place_id}"
                 )
             else:
                 game_url = (
-                    f"https://www.roblox.com/games/"
-                    f"{uid}"
+                    f"https://www.roblox.com/games/{uid}"
                 )
 
-            # IMPORTANT:
-            # The cooldown key does NOT contain "updated".
-            # That means repeated detections of the same game's
-            # update are suppressed for 30 minutes.
-            alert_key = f"game_update:{uid}"
-
-            if should_alert(
+            enqueue_alert(
                 state,
-                alert_key
-            ):
-                alerts.append(
-                    f"🔧 **{name}** was updated "
-                    f"(<{game_url}>)"
-                )
+                f"game_update:{uid}",
+                "Game updates / new badges",
+                f"🔧 **{name}** was updated (<{game_url}>)"
+            )
 
             game_changed = True
 
-        state["game_updated"][key] = updated
+        # Only replace the previous value when a new value exists.
+        if updated:
+            state["game_updated"][key] = updated
 
-        # -----------------------------------------------------------
-        # Badges
-        # -----------------------------------------------------------
+        # -----------------------------------------------------
+        # Badge check
+        # -----------------------------------------------------
 
-        badge_data = get_json(
-            f"https://badges.roblox.com/v1/universes/"
-            f"{uid}/badges"
-            f"?limit=100&sortOrder=Desc"
-        )
+        badge_data = fetch_all_game_badges(uid)
 
-        time.sleep(REQUEST_DELAY)
+        if badge_data is not None:
 
-        if badge_data and "data" in badge_data:
-
-            seen = set(
-                state["game_badges"].get(
-                    key,
-                    []
-                )
+            previous_ids = set(
+                state["game_badges"].get(key, [])
             )
 
             current_ids = [
-                b["id"]
-                for b in badge_data["data"]
+                badge["id"]
+                for badge in badge_data
             ]
 
             new_badges = [
-                b
-                for b in badge_data["data"]
-                if b["id"] not in seen
+                badge
+                for badge in badge_data
+                if badge["id"] not in previous_ids
             ]
 
-            if seen and new_badges:
+            # Check whether a baseline already exists.
+            # This also handles games whose initial badge list
+            # was genuinely empty.
+            if key in state["game_badges"]:
 
                 for badge in new_badges:
 
                     badge_id = badge["id"]
 
-                    alert_key = (
-                        f"new_badge:{uid}:{badge_id}"
+                    badge_name = badge.get(
+                        "name",
+                        "Unknown"
                     )
 
-                    if should_alert(
+                    enqueue_alert(
                         state,
-                        alert_key
-                    ):
-                        alerts.append(
+                        f"new_badge:{uid}:{badge_id}",
+                        "Game updates / new badges",
+                        (
                             f"🏅 New badge in **{name}**: "
-                            f"*{badge.get('name', 'Unknown')}* "
+                            f"*{badge_name}* "
                             f"(<https://www.roblox.com/badges/"
                             f"{badge_id}>)"
                         )
+                    )
 
                     game_changed = True
 
+            # Only save complete badge results.
             state["game_badges"][key] = current_ids
 
-        # -----------------------------------------------------------
-        # Auto-watch game owner
-        # -----------------------------------------------------------
+        # -----------------------------------------------------
+        # Automatically watch game owners
+        # -----------------------------------------------------
 
         if (
             game_changed
@@ -421,28 +574,24 @@ def check_games(state):
             and creator_type == "User"
             and creator_id
         ):
+
             new_owner_watches.append(
-                (
-                    creator_id,
-                    creator_name
-                )
+                (creator_id, creator_name)
             )
 
-    return alerts, new_owner_watches
+    return new_owner_watches
 
 
-# -------------------------------------------------------------------
-# 1b. Specific standalone badges
-# -------------------------------------------------------------------
+# =============================================================
+# 1B. SPECIFIC STANDALONE BADGES
+# =============================================================
 
 def check_extra_badges(state):
-    alerts = []
 
     for badge_id in config.EXTRA_BADGE_IDS:
 
         data = get_json(
-            f"https://badges.roblox.com/v1/badges/"
-            f"{badge_id}"
+            f"https://badges.roblox.com/v1/badges/{badge_id}"
         )
 
         time.sleep(REQUEST_DELAY)
@@ -460,160 +609,33 @@ def check_extra_badges(state):
             {}
         ).get("awardedCount")
 
+        if count is None:
+            continue
+
         key = str(badge_id)
 
-        previous = state[
-            "badge_award_counts"
-        ].get(key)
+        previous = state["badge_award_counts"].get(key)
 
-        if (
-            previous is not None
-            and count is not None
-            and count > previous
-        ):
-            alert_key = (
-                f"extra_badge:{badge_id}"
-            )
+        if previous is not None and count > previous:
 
-            if should_alert(
+            enqueue_alert(
                 state,
-                alert_key
-            ):
-                alerts.append(
-                    f"🏅 **{name}** was just earned "
-                    f"by someone "
+                f"extra_badge:{badge_id}",
+                "Game updates / new badges",
+                (
+                    f"🏅 **{name}** was just earned by someone "
                     f"(award count {previous} → {count}) "
                     f"(<https://www.roblox.com/badges/"
                     f"{badge_id}>)"
                 )
-
-        if count is not None:
-            state[
-                "badge_award_counts"
-            ][key] = count
-
-    return alerts
-
-
-# -------------------------------------------------------------------
-# 2. Groups: new members at watched ranks
-# -------------------------------------------------------------------
-
-def check_groups(state):
-    alerts = []
-
-    for group_id, group_cfg in config.GROUPS.items():
-
-        roles_data = get_json(
-            f"https://groups.roblox.com/v1/groups/"
-            f"{group_id}/roles"
-        )
-
-        time.sleep(REQUEST_DELAY)
-
-        if (
-            not roles_data
-            or "roles" not in roles_data
-        ):
-            continue
-
-        wanted = set(
-            group_cfg["roles"]
-        )
-
-        for role in roles_data["roles"]:
-
-            if role["name"] not in wanted:
-                continue
-
-            role_id = role["id"]
-
-            key = (
-                f"{group_id}:{role_id}"
             )
 
-            members = []
-            cursor = ""
-
-            for _ in range(50):
-
-                url = (
-                    f"https://groups.roblox.com/v1/"
-                    f"groups/{group_id}/roles/"
-                    f"{role_id}/users"
-                    f"?limit=100&cursor={cursor}"
-                )
-
-                data = get_json(url)
-
-                time.sleep(REQUEST_DELAY)
-
-                if (
-                    not data
-                    or "data" not in data
-                ):
-                    break
-
-                members.extend(
-                    u["userId"]
-                    for u in data["data"]
-                )
-
-                cursor = data.get(
-                    "nextPageCursor"
-                )
-
-                if not cursor:
-                    break
-
-            previous_members = set(
-                state["group_members"].get(
-                    key,
-                    []
-                )
-            )
-
-            new_members = [
-                uid
-                for uid in members
-                if uid not in previous_members
-            ]
-
-            if (
-                previous_members
-                and new_members
-            ):
-
-                for uid in new_members:
-
-                    alert_key = (
-                        f"group_member:"
-                        f"{group_id}:"
-                        f"{role_id}:"
-                        f"{uid}"
-                    )
-
-                    if should_alert(
-                        state,
-                        alert_key
-                    ):
-                        alerts.append(
-                            f"⭐ New **{role['name']}** "
-                            f"in *{group_cfg['name']}*: "
-                            f"<https://www.roblox.com/users/"
-                            f"{uid}/profile>"
-                        )
-
-            state[
-                "group_members"
-            ][key] = members
-
-    return alerts
+        state["badge_award_counts"][key] = count
 
 
-# -------------------------------------------------------------------
-# 3. Accounts: who just came online
-# -------------------------------------------------------------------
+# =============================================================
+# 2. ACCOUNT RESOLUTION
+# =============================================================
 
 def resolve_usernames(usernames, state):
 
@@ -628,8 +650,7 @@ def resolve_usernames(usernames, state):
         chunk = missing[i:i + 100]
 
         data = post_json(
-            "https://users.roblox.com/v1/"
-            "usernames/users",
+            "https://users.roblox.com/v1/usernames/users",
             {
                 "usernames": chunk,
                 "excludeBannedUsers": False
@@ -642,9 +663,7 @@ def resolve_usernames(usernames, state):
 
             for user in data["data"]:
 
-                state[
-                    "user_ids"
-                ][
+                state["user_ids"][
                     user["requestedUsername"]
                 ] = user["id"]
 
@@ -655,93 +674,90 @@ def resolve_extra_user_ids(state):
 
         key = str(uid)
 
-        if key in state[
-            "extra_user_names"
-        ]:
+        if key in state["extra_user_names"]:
             continue
 
         data = get_json(
-            f"https://users.roblox.com/v1/users/"
-            f"{uid}"
+            f"https://users.roblox.com/v1/users/{uid}"
         )
 
         time.sleep(REQUEST_DELAY)
 
         if data and "name" in data:
-            state[
-                "extra_user_names"
-            ][key] = data["name"]
-        else:
-            state[
-                "extra_user_names"
-            ][key] = f"User {uid}"
 
+            state["extra_user_names"][key] = data["name"]
+
+        else:
+
+            state["extra_user_names"][key] = f"User {uid}"
+
+
+# =============================================================
+# 3. ONLINE MONITORING
+# =============================================================
 
 def check_online(state, extra_users):
-    alerts = []
 
     resolve_usernames(
         config.WATCH_USERNAMES,
         state
     )
 
-    resolve_extra_user_ids(
-        state
-    )
+    resolve_extra_user_ids(state)
 
     watch_ids = {}
 
     # Config usernames.
     for username in config.WATCH_USERNAMES:
 
-        uid = state[
-            "user_ids"
-        ].get(username)
+        uid = state["user_ids"].get(username)
 
         if uid:
-            watch_ids[uid] = username
+            watch_ids[int(uid)] = username
 
     # Directly watched IDs.
     for uid in config.EXTRA_USER_IDS:
 
-        watch_ids[uid] = state[
+        watch_ids[int(uid)] = state[
             "extra_user_names"
         ].get(
             str(uid),
             f"User {uid}"
         )
 
-    # Dynamically watched owners.
-    for uid, username in state[
-        "dynamic_watch_users"
-    ].items():
+    # Previously discovered game owners.
+    for uid, username in state["dynamic_watch_users"].items():
 
-        watch_ids[int(uid)] = username
+        try:
+            watch_ids[int(uid)] = username
+        except (ValueError, TypeError):
+            continue
 
-    # Newly discovered owners.
+    # Newly discovered game owners.
     for uid, username in extra_users:
+
+        uid = int(uid)
 
         if uid not in watch_ids:
 
-            watch_ids[uid] = username
+            watch_ids[uid] = username or f"User {uid}"
 
-            state[
-                "dynamic_watch_users"
-            ][str(uid)] = username
+            state["dynamic_watch_users"][str(uid)] = (
+                username or f"User {uid}"
+            )
 
-    all_ids = list(
-        watch_ids.keys()
-    )
+    all_ids = list(watch_ids.keys())
 
-    online_now = set()
+    # ---------------------------------------------------------
+    # Retrieve presence
+    # ---------------------------------------------------------
 
     for i in range(0, len(all_ids), 100):
 
         chunk = all_ids[i:i + 100]
 
         data = post_json(
-            "https://presence.roblox.com/v1/"
-            "presence/users",
+            "https://presence.roblox.com/v1/presence/users",
             {
                 "userIds": chunk
             }
@@ -749,133 +765,105 @@ def check_online(state, extra_users):
 
         time.sleep(REQUEST_DELAY)
 
-        if (
-            data
-            and "userPresences" in data
-        ):
+        # If the API fails, preserve previous statuses.
+        if not data or "userPresences" not in data:
+            print("Presence request failed. Keeping previous statuses.")
+            continue
 
-            for presence in data[
-                "userPresences"
-            ]:
+        returned_ids = set()
 
-                # 0 = Offline
-                # 1 = Online
-                # 2 = InGame
-                # 3 = InStudio
+        for presence in data["userPresences"]:
 
-                if presence.get(
-                    "userPresenceType",
-                    0
-                ) != 0:
+            uid = int(presence["userId"])
+            returned_ids.add(uid)
 
-                    online_now.add(
-                        presence["userId"]
-                    )
+            # 0 = Offline
+            # 1 = Online
+            # 2 = InGame
+            # 3 = InStudio
 
-    for uid in all_ids:
-
-        was_online = state[
-            "user_online"
-        ].get(
-            str(uid),
-            False
-        )
-
-        is_online = uid in online_now
-
-        if is_online and not was_online:
-
-            alert_key = (
-                f"user_online:{uid}"
+            is_online = (
+                presence.get("userPresenceType", 0) != 0
             )
 
-            if should_alert(
-                state,
-                alert_key
-            ):
-                alerts.append(
-                    f"🟢 **{watch_ids[uid]}** "
-                    f"just came online "
-                    f"(<https://www.roblox.com/users/"
-                    f"{uid}/profile>)"
+            was_online = state["user_online"].get(
+                str(uid),
+                False
+            )
+
+            if is_online and not was_online:
+
+                enqueue_alert(
+                    state,
+                    f"user_online:{uid}",
+                    "Accounts online",
+                    (
+                        f"🟢 **{watch_ids[uid]}** just came online "
+                        f"(<https://www.roblox.com/users/"
+                        f"{uid}/profile>)"
+                    )
                 )
 
-        state[
-            "user_online"
-        ][str(uid)] = is_online
+            state["user_online"][str(uid)] = is_online
 
-    return alerts
+        # If Roblox omits an ID from a successful response,
+        # preserve its previous status rather than assuming offline.
+        missing_ids = set(chunk) - returned_ids
+
+        if missing_ids:
+            print(
+                f"Presence response omitted {len(missing_ids)} "
+                "account(s). Their previous statuses were preserved."
+            )
 
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
+# =============================================================
+# 4. MAIN
+# =============================================================
 
 def main():
 
+    print("=" * 55)
+    print("ROBLOX MYTH-HUNTING BOT")
+    print("=" * 55)
+
     if not WEBHOOK_URL:
         print(
-            "WARNING: DISCORD_WEBHOOK_URL is not set — "
-            "alerts will be printed only."
+            "WARNING: DISCORD_WEBHOOK_URL is not set. "
+            "Notifications will remain queued."
         )
 
     state = load_state()
 
-    print("Checking games...")
+    print("\nChecking games...")
 
-    game_alerts, new_owner_watches = check_games(
-        state
-    )
+    new_owner_watches = check_games(state)
 
-    print("Checking standalone badges...")
+    print("\nChecking standalone badges...")
 
-    badge_alerts = check_extra_badges(
-        state
-    )
+    check_extra_badges(state)
 
-    print("Checking groups...")
+    print("\nChecking online accounts...")
 
-    group_alerts = check_groups(
-        state
-    )
-
-    print("Checking online status...")
-
-    online_alerts = check_online(
+    check_online(
         state,
         new_owner_watches
     )
 
-    # Save state BEFORE sending Discord messages.
-    # This includes the cooldown timestamps.
+    # Save discoveries and pending notifications before delivery.
     save_state(state)
 
-    send_to_discord(
-        game_alerts + badge_alerts,
-        "Game updates / new badges"
-    )
+    print("\nDelivering pending notifications...")
 
-    send_to_discord(
-        group_alerts,
-        "New group members"
-    )
+    deliver_pending_alerts(state)
 
-    send_to_discord(
-        online_alerts,
-        "Accounts online"
-    )
+    pending_count = len(state["pending_alerts"])
 
-    total = (
-        len(game_alerts)
-        + len(badge_alerts)
-        + len(group_alerts)
-        + len(online_alerts)
-    )
-
-    print(
-        f"Done. {total} alert(s) sent. "
-        f"Run finished at {now_iso()}."
-    )
+    print("\n" + "=" * 55)
+    print("CHECK COMPLETE")
+    print(f"Pending notifications: {pending_count}")
+    print(f"Finished at: {now_iso()}")
+    print("=" * 55)
 
 
 if __name__ == "__main__":
